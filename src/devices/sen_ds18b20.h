@@ -39,6 +39,12 @@ typedef struct {
     int state;
     int statebit;
     int TimerID;
+
+    // NUEVAS VARIABLES PARA TIMING PRECISO
+    uint64_t reset_start_time;    // Timestamp del falling edge del reset
+    uint64_t last_edge_time;      // Último cambio de edge
+    int reset_timer_id;           // Timer específico para reset pulse
+
 } sen_ds18b20_t;
 
 void sen_ds18b20_rst(sen_ds18b20_t* ds18b20);

@@ -101,13 +101,13 @@ static void sen_ds18b20_callback(void* arg) {
             switch (ds18b20->statebit) {
                 case 0:
                     ds18b20->out = 0;  // odd values are logic one
-                    ds18b20->pboard->TimerChange_us(ds18b20->TimerID, 200);
+                    ds18b20->pboard->TimerChange_us(ds18b20->TimerID, 120);
                     ioupdated = 1;
                     ds18b20->statebit++;
                     break;
                 case 1:
                     ds18b20->out = 1;  // odd values are logic one
-                    ds18b20->pboard->TimerChange_us(ds18b20->TimerID, 200);
+                    ds18b20->pboard->TimerChange_us(ds18b20->TimerID, 240);
                     ioupdated = 1;
                     ds18b20->statebit++;
                     break;
@@ -118,7 +118,7 @@ static void sen_ds18b20_callback(void* arg) {
                     ds18b20->state = OW_CMD;
                     ds18b20->statebit = 0;
                     ds18b20->datain = 0;
-                    break;
+                    dprintf("ds18b20 presence sequence complete - ready for commands\n");                    break;
             }
             break;
         case OW_CMD:
@@ -331,8 +331,14 @@ void sen_ds18b20_init(sen_ds18b20_t* ds18b20, board* pboard) {
     dprintf("ds18b20 init\n");
     srand(time(NULL));
     ds18b20->pboard = pboard;
-    ds18b20->TimerID = ds18b20->pboard->TimerRegister_ms(1, sen_ds18b20_callback, ds18b20);
+    ds18b20->TimerID = ds18b20->pboard->TimerRegister_us(100, sen_ds18b20_callback, ds18b20);
     ds18b20->pboard->TimerSetState(ds18b20->TimerID, 0);
+
+    // Inicializar nuevas variables de timing
+    ds18b20->reset_start_time = 0;
+    ds18b20->last_edge_time = 0;
+    ds18b20->reset_timer_id = 0;
+
     ds18b20->addr[0] = 0x28;  // device type
     ds18b20->addr[1] = rand();
     ds18b20->addr[2] = rand();
@@ -351,35 +357,42 @@ void sen_ds18b20_end(sen_ds18b20_t* ds18b20) {
 
 unsigned char sen_ds18b20_io(sen_ds18b20_t* ds18b20, const unsigned char data) {
     // dprintf("data = %i ldata =%i state = %i \n", data, ds18b20->ldata, ds18b20->state);
+    static int ioupdated = 0;
 
     if (!data && ds18b20->ldata) {  // falling edge
+        // Guardar timestamp del falling edge
+        ds18b20->last_edge_time = ds18b20->pboard->GetInstCounter_us(0);
+
         switch (ds18b20->state) {
             case OW_IDLE:
-                dprintf("ds18b20 reset\n");
-                ds18b20->start = ds18b20->pboard->GetInstCounter();
+                dprintf("ds18b20 reset falling edge\n");
+                ds18b20->reset_start_time = ds18b20->last_edge_time;
                 ds18b20->state = OW_RESET;
                 ds18b20->out = 1;
+
+                // Configurar timer para verificar reset mínimo (480μs)
+                ds18b20->reset_timer_id = ds18b20->pboard->TimerRegister_us(480.0, reset_timeout_callback, ds18b20);
                 break;
             case OW_CMD:
                 dprintf("ds18b20 CMD data edge %i\n", ds18b20->statebit);
-                ds18b20->pboard->TimerChange_us(ds18b20->TimerID, 30);  // sample time
+                ds18b20->pboard->TimerChange_us(ds18b20->TimerID, 15);  // sample time
                 ds18b20->pboard->TimerSetState(ds18b20->TimerID, 1);
                 break;
             case OW_MROM:
                 dprintf("ds18b20 MROM data edge %i\n", ds18b20->statebit);
-                ds18b20->pboard->TimerChange_us(ds18b20->TimerID, 30);  // sample time
+                ds18b20->pboard->TimerChange_us(ds18b20->TimerID, 15);  // sample time
                 ds18b20->pboard->TimerSetState(ds18b20->TimerID, 1);
                 break;
             case OW_RSPAD:
             case OW_RROM:
                 dprintf("ds18b20 RSPAD data edge %i\n", ds18b20->statebit);
-                ds18b20->pboard->TimerChange_us(ds18b20->TimerID, 10);  // sample time
+                ds18b20->pboard->TimerChange_us(ds18b20->TimerID, 6);  // sample time
                 ds18b20->pboard->TimerSetState(ds18b20->TimerID, 1);
                 ds18b20->out = 0;
                 break;
             case OW_SROM:
                 dprintf("ds18b20 RSPAD data edge %i\n", ds18b20->statebit);
-                ds18b20->pboard->TimerChange_us(ds18b20->TimerID, (ds18b20->start == 4) ? 30 : 10);  // sample time
+                ds18b20->pboard->TimerChange_us(ds18b20->TimerID, (ds18b20->start == 4) ? 15 : 6);  // sample time
                 ds18b20->pboard->TimerSetState(ds18b20->TimerID, 1);
                 ds18b20->out = 0;
                 break;
@@ -388,30 +401,51 @@ unsigned char sen_ds18b20_io(sen_ds18b20_t* ds18b20, const unsigned char data) {
         }
 
     } else if (data && !ds18b20->ldata) {  // rising edge
+        uint64_t current_time = ds18b20->pboard->GetInstCounter_us(0);
+
         switch (ds18b20->state) {
             case OW_RESET: {
-                int pulse = ds18b20->pboard->GetInstCounter_us(ds18b20->start);
-                if ((pulse > 450) && (pulse < 10000)) {  // valid start
+               // Calcular duración del pulso con precisión
+               uint64_t pulse_duration = current_time - ds18b20->reset_start_time;
+
+               dprintf("ds18b20 reset pulse duration: %llu μs\n", pulse_duration);
+               if ((pulse_duration >= 480) && (pulse_duration <= 10000)) {
+                    dprintf("ds18b20 valid reset detected (%llu μs)\n", pulse_duration);
+
                     ds18b20->state = OW_PRESENCE;
                     ds18b20->statebit = 0;
-
-                    dprintf("ds18b20 presence\n");
                     ds18b20->out = 1;
+
+                    // Esperar 15-60μs antes del presence pulse (especificación 1-Wire)
                     ds18b20->pboard->TimerChange_us(ds18b20->TimerID, 30);
                     ds18b20->pboard->TimerSetState(ds18b20->TimerID, 1);
-
                 } else {
+                    dprintf("ds18b20 invalid reset pulse (%llu μs)\n", pulse_duration);
                     ds18b20->state = OW_IDLE;
                     ds18b20->out = 1;
-                    ds18b20->pboard->TimerSetState(ds18b20->TimerID, 0);
                 }
-            } break;
+
+                if (ds18b20->reset_timer_id > 0) {
+                    ds18b20->pboard->TimerSetState(ds18b20->reset_timer_id, 0);
+                    ds18b20->reset_timer_id = 0;
+                }
+                break;
+
             default:
                 break;
         }
     }
     ds18b20->ldata = (data & 0x01);
     return ds18b20->out;
+}
+
+static void reset_timeout_callback(void* arg) {
+    sen_ds18b20_t* ds18b20 = (sen_ds18b20_t*)arg;
+
+    // Si llegamos aquí, el reset pulse ha durado al menos 480μs
+    dprintf("ds18b20 reset timeout - minimum pulse detected\n");
+
+    // No hacer nada aquí, esperar al rising edge para confirmar duración total
 }
 
 void sen_ds18b20_setTemp(sen_ds18b20_t* ds18b20, const float temp) {
